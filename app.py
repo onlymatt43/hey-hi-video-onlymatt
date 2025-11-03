@@ -343,9 +343,15 @@ async def chat_with_memory(body: ChatBody, stream: int = Query(default=0)):
         try:
             past = await load_memory(session_id, project_id, MEMORY_MAX_TURNS)
             if past:
-                messages = past + messages
+                system_preface = {
+                    "role": "system",
+                    "content": (
+                        "Utilise l'historique ci-dessous pour répondre de façon cohérente. "
+                        "Si l'utilisateur a partagé un fait (ex: son nom, préférences), réutilise-le quand c'est pertinent."
+                    )
+                }
+                messages = [system_preface] + past + messages
         except Exception as e:
-            # ne bloque pas la requête si la mémoire a un souci
             print("[memory] load error:", repr(e))
 
     headers = {
@@ -377,13 +383,13 @@ async def chat_with_memory(body: ChatBody, stream: int = Query(default=0)):
             data = r.json()
             usage = data.get("usage", {}) or {}
 
-            # Sauvegarde asynchrone dans Turso (logs + mémoire future)
+            # Sauvegarde synchrone (mémoire garantie immédiatement)
             try:
-                asyncio.create_task(save_chat(
+                await save_chat(
                     session_id, model, messages, data,
                     usage.get("prompt_tokens"), usage.get("completion_tokens"),
                     project_id
-                ))
+                )
             except Exception as e:
                 print("[save_chat] error:", repr(e))
 
