@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.requests import Request
 import httpx
 from pydantic import BaseModel
 from libsql_client import create_client
@@ -32,6 +33,16 @@ MEMORY_MAX_TURNS = int(os.getenv("MEMORY_MAX_TURNS", "50"))  # 50 derniers tours
 
 # ==================== APP & CORS ====================
 app = FastAPI()
+
+# --- DEBUG GLOBAL: middleware pour voir les erreurs en JSON ---
+@app.middleware("http")
+async def catch_all(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as e:
+        # => au lieu d'un "Internal Server Error" texte brut, tu verras {"error": "...", "detail": "..."}
+        return JSONResponse({"error": "UNHANDLED_EXCEPTION", "detail": str(e)}, status_code=500)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -224,9 +235,10 @@ async def favicon():
     # 204 pour ne rien renvoyer et éviter le 404
     return Response(status_code=204)
 
+# --- Version pour vérifier que le bon code est déployé ---
 @app.get("/__version")
 async def __version():
-    return {"version": "memory-fix-v3"}
+    return {"version": "minimal-openai-proxy-v1"}
 
 @app.get("/healthz")
 async def healthz():
@@ -310,156 +322,54 @@ async def _embed_cached(text: str) -> list[float]:
     EMBED_CACHE.cache[key] = vec
     return vec
 
+# === /api/chat minimal : isole OpenAI, pas de DB/memoire/RAG ===
 @app.post("/api/chat")
-async def chat(body: ChatBody, stream: int = Query(default=0)):
+async def chat_min(body: ChatBody, stream: int = Query(default=0)):
     if not OPENAI_API_KEY:
-        return JSONResponse(status_code=500, content={"code": "MISSING_API_KEY", "message": "OPENAI_API_KEY manquante"})
-
-    model = body.model or CHAT_MODEL
-    messages = [m.model_dump() for m in body.messages]
-    session_id = body.session_id or str(uuid.uuid4())
-    project_id = body.project_id
-
-    # -------- Mémoire : prépendre l'historique --------
-    if MEMORY_ENABLED:
-        past = await load_memory(session_id, project_id, MEMORY_MAX_TURNS)
-        if past:
-            messages = past + messages
-
-    # -------- Retrieval (KB) --------
-    user_query = ""
-    for m in reversed(messages):
-        if m["role"] == "user":
-            user_query = m["content"]
-            break
-
-    context = ""
-    try:
-        # Ne lance le RAG que si TOP_K > 0 et qu'il y a une question
-        if TOP_K > 0 and db and user_query.strip():
-            q_vec = await _embed_cached(user_query)
-            q = np.array(q_vec, dtype=np.float32)
-
-            res = await db_exec("SELECT title, chunk, embedding FROM kb_chunks", [])
-            rows = getattr(res, "rows", None) or res or []
-            scored = []
-            for row in rows:
-                title, chunk, blob = row
-                v = np.frombuffer(blob, dtype="<f4")
-                s = float(np.dot(q, v) / (np.linalg.norm(q) * np.linalg.norm(v) + 1e-8))
-                scored.append((s, title, chunk))
-            scored.sort(key=lambda x: x[0], reverse=True)
-            top = scored[:TOP_K]
-            if top:
-                context = "\n\n".join([f"[{t}] {c}" for _, t, c in top])
-
-        if context:
-            system_preface = (
-                "Tu dois répondre en t'appuyant STRICTEMENT sur le contexte suivant. "
-                "Si l'information est absente, dis-le.\n\n"
-                f"=== CONTEXTE ===\n{context}\n=== FIN CONTEXTE ==="
-            )
-            messages = [{"role": "system", "content": system_preface}] + messages
-    except Exception as e:
-        # ne casse pas la requête si la récupération KB échoue
-        print("[KB retrieval error]", repr(e))
+        return JSONResponse(status_code=500, content={"error":"MISSING_OPENAI_API_KEY"})
 
     headers = {
-        "Content-Type": "application/json",
         "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream" if stream else "application/json",
     }
-    org = os.getenv("OPENAI_ORG_ID")
-    if org:
-        headers["OpenAI-Organization"] = org
-    proj = os.getenv("OPENAI_PROJECT_ID")
-    if proj:
-        headers["OpenAI-Project"] = proj
+    payload = {
+        "model": body.model or CHAT_MODEL,
+        "messages": [m.model_dump() for m in body.messages],
+        "stream": bool(stream),
+    }
+    timeout = httpx.Timeout(connect=10, read=70)
 
-    # Utile pour certains proxies/upstreams en streaming
-    headers_stream = dict(headers)
-    headers_stream["Accept"] = "text/event-stream"
-
-    payload = {"model": model, "messages": messages, "stream": bool(stream)}
-    timeout = httpx.Timeout(connect=LLM_CONNECT_TIMEOUT, read=LLM_READ_TIMEOUT)
-
-    # ---- Non-stream : renvoyer clairement l'erreur OpenAI au client ----
     if not stream:
+        # Non-stream: renvoie directement la réponse (ou l'erreur) OpenAI
         try:
-            async with httpx.AsyncClient(timeout=timeout, http2=False) as client:
-                r = await client.post(OPENAI_CHAT_URL, headers=headers, json=payload)
+            async with httpx.AsyncClient(timeout=timeout, http2=False) as c:
+                r = await c.post(OPENAI_CHAT_URL, headers=headers, json=payload)
             if r.status_code >= 400:
-                # Propager l'erreur OpenAI en clair
-                return JSONResponse(
-                    status_code=r.status_code,
-                    content={
-                        "provider": "openai",
-                        "error": "UPSTREAM_ERROR",
-                        "status": r.status_code,
-                        "body": r.text,
-                    },
-                )
-            data = r.json()
-            usage = data.get("usage", {}) or {}
-            asyncio.create_task(
-                save_chat(
-                    session_id, model, messages, data,
-                    usage.get("prompt_tokens"), usage.get("completion_tokens"),
-                    project_id
-                )
-            )
-            return {
-                "provider": "openai",
-                "model": model,
-                "choices": data.get("choices", []),
-                "usage": usage,
-                "session_id": session_id,
-            }
+                return JSONResponse(status_code=r.status_code, content={
+                    "provider":"openai","status":r.status_code,"body": r.text
+                })
+            d = r.json()
+            return {"provider":"openai","choices": d.get("choices", []), "usage": d.get("usage", {})}
         except Exception as e:
-            # Renvoie un message d'erreur lisible (au lieu d'un 500 opaque)
-            return JSONResponse(status_code=502, content={
-                "error": "NONSTREAM_EXCEPTION",
-                "message": str(e)
-            })
+            return JSONResponse(status_code=502, content={"error":"OPENAI_PROXY_FAIL","message":str(e)})
 
-    # ---- Streaming SSE : http2 désactivé + Accept: text/event-stream ----
-    async def sse_gen() -> AsyncIterator[str]:
-        collected: list[str] = []
+    # Streaming SSE minimal (HTTP/1.1 forcé)
+    async def sse_gen():
         try:
-            async with httpx.AsyncClient(timeout=timeout, http2=False) as client:
-                async with client.stream("POST", OPENAI_CHAT_URL, headers=headers_stream, json=payload) as resp:
+            async with httpx.AsyncClient(timeout=timeout, http2=False) as c:
+                async with c.stream("POST", OPENAI_CHAT_URL, headers=headers, json=payload) as resp:
                     if resp.status_code >= 400:
                         txt = (await resp.aread()).decode("utf-8", "ignore")
-                        yield f"data: {json.dumps({'error': resp.status_code, 'message': txt})}\n\n"
+                        yield f"data: {json.dumps({'status': resp.status_code, 'body': txt})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
                     async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        if line.startswith("data:"):
-                            chunk = line[5:].strip()
-                            if chunk and chunk != "[DONE]":
-                                try:
-                                    j = json.loads(chunk)
-                                    piece = j.get("choices", [{}])[0].get("delta", {}).get("content")
-                                    if piece:
-                                        collected.append(piece)
-                                except Exception:
-                                    pass
+                        if line and line.startswith("data:"):
                             yield line + "\n\n"
                     yield "data: [DONE]\n\n"
         except Exception as e:
-            # Surface l'erreur dans le flux SSE
-            yield f"data: {json.dumps({'error':'STREAM_FAILED','message':str(e)})}\n\n"
+            yield f"data: {json.dumps({'error':'STREAM_FAIL','message':str(e)})}\n\n"
             yield "data: [DONE]\n\n"
-        finally:
-            if db is not None:
-                response_json = {
-                    "streamed": True,
-                    "model": model,
-                    "content": "".join(collected) if collected else None,
-                }
-                asyncio.create_task(
-                    save_chat(session_id, model, messages, response_json, None, None, project_id)
-                )
 
     return StreamingResponse(sse_gen(), media_type="text/event-stream")
