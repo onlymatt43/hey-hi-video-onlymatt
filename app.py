@@ -215,6 +215,10 @@ async def favicon():
     # 204 pour ne rien renvoyer et éviter le 404
     return Response(status_code=204)
 
+@app.get("/__version")
+async def __version():
+    return {"version": "chat-upstream-error-patch-v1"}
+
 @app.get("/healthz")
 async def healthz():
     kb_count = None
