@@ -226,7 +226,7 @@ async def favicon():
 
 @app.get("/__version")
 async def __version():
-    return {"version": "chat-upstream-error-patch-v1"}
+    return {"version": "memory-fix-v3"}
 
 @app.get("/healthz")
 async def healthz():
