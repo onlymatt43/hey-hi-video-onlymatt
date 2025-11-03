@@ -3,6 +3,7 @@ import os, json, asyncio, uuid, math, struct
 from typing import AsyncIterator, Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 from pydantic import BaseModel
@@ -190,6 +191,30 @@ async def load_memory(session_id: Optional[str], project_id: Optional[str], max_
     return convo[-(max_turns*2):]
 
 # ==================== HEALTH & MIGRATE ====================
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    # Petite page d'accueil pour éviter le 404
+    return """
+    <!doctype html>
+    <html lang="fr">
+    <head><meta charset="utf-8"><title>AI Connector</title></head>
+    <body style="font-family:system-ui;max-width:720px;margin:40px auto;">
+      <h1>AI Connector — Render + OpenAI + Turso</h1>
+      <p>Service opérationnel.</p>
+      <ul>
+        <li>Healthcheck: <a href="/healthz">/healthz</a></li>
+        <li>Chat API (POST): <code>/api/chat?stream=1</code></li>
+        <li>Migrate (POST): <code>/migrate</code></li>
+      </ul>
+    </body>
+    </html>
+    """
+
+@app.get("/favicon.ico")
+async def favicon():
+    # 204 pour ne rien renvoyer et éviter le 404
+    return Response(status_code=204)
+
 @app.get("/healthz")
 async def healthz():
     kb_count = None
