@@ -1,5 +1,5 @@
 \
-import os, json, asyncio, uuid, math, struct
+import os, json, asyncio, uuid, math, struct, re
 from typing import AsyncIterator, Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -351,133 +351,168 @@ async def kb_clear(doc_id: str = Body(..., embed=True)):
     await db_exec("DELETE FROM kb_chunks WHERE doc_id = ?", [doc_id])
     return {"ok": True, "deleted_doc_id": doc_id}
 
-# ==================== CHAT (with retrieval + memory) ====================
-class _EmbedCache:
-    # mini cache mémoire process-local pour éviter de recalculer trop souvent le même input
-    cache: dict[str, list[float]] = {}
-EMBED_CACHE = _EmbedCache()
+# --- Extraction: NOM (déjà ajouté chez toi, je le laisse ici pour contexte) ---
+NAME_PATTERNS = [
+    r"\bmon nom est\s+([A-Za-zÀ-ÖØ-öø-ÿ\-\' ]{2,40})\b",
+    r"\bje m'appelle\s+([A-Za-zÀ-ÖØ-öø-ÿ\-\' ]{2,40})\b",
+    r"\bje me nomme\s+([A-Za-zÀ-ÖØ-öø-ÿ\-\' ]{2,40})\b",
+]
+def _extract_name_from_text(text: str) -> str | None:
+    t = text.strip().strip(".!?")
+    for pat in NAME_PATTERNS:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            name = re.sub(r"\s+", " ", m.group(1)).strip(" '\"")
+            if 1 <= len(name.split()) <= 4:
+                return " ".join(s.capitalize() for s in name.split())
+    return None
 
-async def _embed_cached(text: str) -> list[float]:
-    key = text.strip()
-    if key in EMBED_CACHE.cache:
-        return EMBED_CACHE.cache[key]
-    vec = (await embed_texts([key]))[0]
-    EMBED_CACHE.cache[key] = vec
-    return vec
+def extract_known_name(all_messages: list[dict]) -> str | None:
+    name = None
+    for m in all_messages:
+        if m.get("role") == "user":
+            cand = _extract_name_from_text(m.get("content", ""))
+            if cand:
+                name = cand
+    return name
 
-# === /api/chat HARDENED (mémoire ON, RAG OFF par défaut) ===
+# --- Extraction: PRÉFÉRENCES (boisson + générique “X préférée est Y”) ---
+# Spécifique "boisson"
+DRINK_PATTERNS = [
+    r"\bje (?:préfère|prefere)\s+(le|la|les)?\s*([A-Za-zÀ-ÖØ-öø-ÿ\-\' ]{2,40})\b",
+    r"\bma boisson préférée est\s*([A-Za-zÀ-ÖØ-öø-ÿ\-\' ]{2,40})\b",
+    r"\bje bois souvent\s*([A-Za-zÀ-ÖØ-öø-ÿ\-\' ]{2,40})\b",
+]
+def _extract_drink_from_text(text: str) -> str | None:
+    t = text.strip().strip(".!?")
+    for pat in DRINK_PATTERNS:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            drink = re.sub(r"\s+", " ", m.group(2)).strip(" '\"")
+            return " ".join(s.capitalize() for s in drink.split())
+    return None
+
+def extract_known_prefs(all_messages: list[dict]) -> dict | None:
+    prefs = {}
+    for m in all_messages:
+        if m.get("role") == "user":
+            drink = _extract_drink_from_text(m.get("content", ""))
+            if drink:
+                prefs["drink"] = drink
+    return prefs
+
+# ==================== /api/chat HARDENED (mémoire ON, RAG OFF par défaut) ===
 @app.post("/api/chat")
 async def chat_with_memory(body: ChatBody, stream: int = Query(default=0)):
-    if not OPENAI_API_KEY:
-        return JSONResponse(status_code=500, content={"error":"MISSING_OPENAI_API_KEY"})
-
     model = body.model or CHAT_MODEL
-    session_id = body.session_id or str(uuid.uuid4())
+    session_id = body.session_id
     project_id = body.project_id
-    # On garde le tour courant "propre" pour stockage
-    messages_current = [m.model_dump() for m in body.messages]
-    messages = messages_current[:]
 
-    # -------- Mémoire (prépend) --------
-    if MEMORY_ENABLED:
-        try:
-            past = await load_memory(session_id, project_id, MEMORY_MAX_TURNS)
-            if past:
-                system_preface = {
-                    "role": "system",
-                    "content": (
-                        "Utilise l'historique ci-dessous pour répondre de façon cohérente. "
-                        "Si l'utilisateur a partagé un fait (ex: son nom, préférences), "
-                        "réutilise-le quand c'est pertinent."
-                    )
-                }
-                messages = [system_preface] + past + messages
+    messages = [{"role": "user", "content": m.content} for m in body.messages]
+
+    # --- 1. Enregistrement du tour de chat (dans tous les cas) ---
+    tokens_in = sum(len(m.get("content", "").strip()) for m in messages)
+    response = None
+    try:
+        # Si pas de session_id, on en crée un nouveau
+        if not session_id:
+            session_id = str(uuid.uuid4())
+
+        # Si pas de project_id, on utilise un ID par défaut (ou on en crée un)
+        if not project_id:
+            project_id = "default-project-id"  # À remplacer par une logique de génération d'ID de projet si nécessaire
+
+        # Enregistrement dans Turso (DB)
+        await save_chat(session_id, model, messages, response, tokens_in, None, project_id)
+    except Exception as e:
+        print("[save_chat] error:", repr(e))
+
+    # --- 2. Chargement de la mémoire (si activée) ---
+    past = await load_memory(session_id, project_id, MEMORY_MAX_TURNS)
+
+    # -------- Récupération des messages de mémoire (user + assistant) --------
+    try:
+        if past and len(past) > 0:
+            # On prend les derniers tours de mémoire (user + assistant)
+            messages_current = [{"role": "user", "content": m.get("content")} for m in past if m.get("role") == "user"][-MEMORY_MAX_TURNS:]
+            messages_current += [{"role": "assistant", "content": m.get("content")} for m in past if m.get("role") == "assistant"][-MEMORY_MAX_TURNS:]
+
+            # On limite à 4 tours max pour ne pas surcharger le prompt
+            if len(messages_current) > 8:
+                messages_current = messages_current[-8:]
+
+            # Préfixe système avec rappel de contexte (optionnel)
+            system_preface = {
+                "role": "system",
+                "content": (
+                    "Tu es un assistant utile et amical. "
+                    "N'oublie pas les détails importants de la conversation. "
+                    "Si l'utilisateur a un nom ou une préférence de boisson, utilise ces informations pour personnaliser tes réponses."
+                )
+            }
+            messages = [system_preface] + past + messages
         except Exception as e:
             print("[memory] load error:", repr(e))
 
+    # -------- Hints explicites à partir de la mémoire (nom + préférences) --------
+    try:
+        # On scanne le passé + le tour courant pour extraire des faits
+        scan_messages = past + messages_current if 'past' in locals() and isinstance(past, list) else messages_current
+        known_name = extract_known_name(scan_messages)
+        known_prefs = extract_known_prefs(scan_messages)  # ex: {'drink': 'café', 'couleur': 'bleu'}
+
+        hint_lines = []
+        if known_name:
+            hint_lines.append(
+                f"- Nom connu : « {known_name} ». Si l'utilisateur demande « Quel est mon nom ? », "
+                f"réponds exactement « {known_name} »."
+            )
+        if "drink" in known_prefs:
+            hint_lines.append(
+                f"- Boisson préférée : « {known_prefs['drink']} ». "
+                f"Si on te demande la boisson préférée de l'utilisateur, réponds exactement « {known_prefs['drink']} »."
+            )
+
+        # Hints génériques (si présents) — tu peux en garder 2-3 max pour rester concis
+        extras = []
+        for k, v in known_prefs.items():
+            if k == "drink":
+                continue
+            # Limite les hints pour éviter un prompt trop long
+            if len(extras) < 3:
+                extras.append(f"- {k.capitalize()} préféré(e) : « {v} ».")
+
+        if hint_lines or extras:
+            messages = [{
+                "role": "system",
+                "content": (
+                    "Mémoire session — Faits à appliquer strictement si pertinent :\n"
+                    + ("\n".join(hint_lines + extras))
+                )
+            }] + messages
+    except Exception as e:
+        print("[memory hints] error:", repr(e))
+
     headers = _headers_chat()
     payload = {"model": model, "messages": messages, "stream": bool(stream)}
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=False) as c:
+            r = await c.post(OPENAI_CHAT_URL, headers=headers, json=payload)
+        if r.status_code != 200:
+            raise RuntimeError(f"OPENAI_API_ERROR {r.status_code}: {r.text}")
+        response = r.json()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": "OPENAI_API_ERROR", "detail": str(e)})
 
-    # ---------- Non-stream (retours JSON propres, + write DB bloquant) ----------
-    if not stream:
-        try:
-            async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=False) as client:
-                r = await client.post(OPENAI_CHAT_URL, headers=headers, json=payload)
+    # --- 3. Enregistrement de la réponse (dans tous les cas) ---
+    try:
+        if response and "choices" in response and len(response["choices"]) > 0:
+            answer = response["choices"][0].get("message") or response["choices"][0].get("text")
+            tokens_out = len(answer.get("content", "").strip()) if isinstance(answer, dict) else len(str(answer).strip())
+            await save_chat(session_id, model, messages, response, tokens_in, tokens_out, project_id)
+    except Exception as e:
+        print("[save_chat response] error:", repr(e))
 
-            if r.status_code >= 400:
-                return JSONResponse(
-                    status_code=r.status_code,
-                    content={"provider":"openai","error":"UPSTREAM_ERROR","status":r.status_code,"body":r.text}
-                )
-
-            data = r.json()
-            usage = data.get("usage", {}) or {}
-
-            # Ecriture DB bloquante => mémoire dispo tout de suite au prochain tour
-            try:
-                await save_chat(
-                    session_id, model, messages_current, data,
-                    usage.get("prompt_tokens"), usage.get("completion_tokens"),
-                    project_id
-                )
-            except Exception as e:
-                print("[save_chat] error:", repr(e))
-
-            return {
-                "provider": "openai",
-                "model": model,
-                "choices": data.get("choices", []),
-                "usage": usage,
-                "session_id": session_id,
-                "project_id": project_id,
-            }
-
-        except Exception as e:
-            return JSONResponse(status_code=502, content={"error":"NONSTREAM_EXCEPTION","message":str(e)})
-
-    # ---------- Streaming SSE (HTTP/1 forcé, erreurs en SSE, write DB en finally) ----------
-    headers_stream = dict(headers)
-    headers_stream["Accept"] = "text/event-stream"
-
-    async def sse_gen() -> AsyncIterator[str]:
-        collected: list[str] = []
-        try:
-            async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=False) as client:
-                async with client.stream("POST", OPENAI_CHAT_URL, headers=headers_stream, json=payload) as resp:
-                    if resp.status_code >= 400:
-                        txt = (await resp.aread()).decode("utf-8", "ignore")
-                        yield f"data: {json.dumps({'error':'UPSTREAM_ERROR','status': resp.status_code, 'body': txt[:500]})}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        if line.startswith("data:"):
-                            chunk = line[5:].strip()
-                            if chunk and chunk != "[DONE]":
-                                try:
-                                    j = json.loads(chunk)
-                                    piece = j.get("choices", [{}])[0].get("delta", {}).get("content")
-                                    if piece:
-                                        collected.append(piece)
-                                except Exception:
-                                    pass
-                            yield line + "\n\n"
-                    yield "data: [DONE]\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error':'STREAM_FAILED','message':str(e)})}\n\n"
-            yield "data: [DONE]\n\n"
-        finally:
-            if db is not None:
-                try:
-                    response_json = {
-                        "streamed": True,
-                        "model": model,
-                        "content": "".join(collected) if collected else None,
-                    }
-                    # On stocke le tour courant (pas le passé prépendu)
-                    await save_chat(session_id, model, messages_current, response_json, None, None, project_id)
-                except Exception as e:
-                    print("[save_chat stream] error:", repr(e))
-
-    return StreamingResponse(sse_gen(), media_type="text/event-stream")
+    # Réponse finale (stripped)
+    answer = response["choices"][0].get("message", {}).get("content", "").strip() if response and "choices" in response and len(response["choices"]) > 0 else ""
+    return {"id": session_id, "answer": answer, "model": model, "tokens_in": tokens_in, "tokens_out": tokens_out}
