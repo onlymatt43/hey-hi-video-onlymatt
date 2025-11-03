@@ -338,7 +338,7 @@ async def chat_min(body: ChatBody, stream: int = Query(default=0)):
         "messages": [m.model_dump() for m in body.messages],
         "stream": bool(stream),
     }
-    timeout = httpx.Timeout(connect=10, read=70)
+    timeout = httpx.Timeout(connect=10.0, read=70.0, write=70.0, pool=10.0)
 
     if not stream:
         # Non-stream: renvoie directement la réponse (ou l'erreur) OpenAI
