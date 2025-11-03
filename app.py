@@ -141,8 +141,13 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
         return []
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": EMBED_MODEL, "input": texts}
-    timeout = httpx.Timeout(connect=LLM_CONNECT_TIMEOUT, read=LLM_READ_TIMEOUT)
-    async with httpx.AsyncClient(timeout=timeout) as c:
+    timeout = httpx.Timeout(
+        connect=LLM_CONNECT_TIMEOUT,
+        read=LLM_READ_TIMEOUT,
+        write=LLM_READ_TIMEOUT,
+        pool=LLM_CONNECT_TIMEOUT,
+    )
+    async with httpx.AsyncClient(timeout=timeout, http2=False) as c:
         r = await c.post(OPENAI_EMBED_URL, headers=headers, json=payload)
         r.raise_for_status()
         d = r.json()
