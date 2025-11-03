@@ -139,23 +139,35 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
 
 # ==================== MEMORY ====================
 async def load_memory(session_id: Optional[str], project_id: Optional[str], max_turns: int) -> list[dict]:
-    """
-    Reconstruit les derniers tours user/assistant depuis chat_logs.
-    Retourne une liste [{'role':'user'|'assistant','content':'...'}, ...] en ordre chronologique.
-    """
     if not db or not session_id:
         return []
+    limit = int(max_turns * 2)  # user+assistant
     if project_id:
-        res = await db_exec(
-            "SELECT messages_json, response_json FROM chat_logs WHERE session_id = ? AND (project_id = ? OR project_id IS NULL) ORDER BY id DESC LIMIT ?",
-            [session_id, project_id, max_turns * 2]
-        )
+        sql = f"""
+            SELECT messages_json, response_json
+            FROM chat_logs
+            WHERE session_id = ? AND (project_id = ? OR project_id IS NULL)
+            ORDER BY id DESC
+            LIMIT {limit}
+        """
+        params = [session_id, project_id]
     else:
-        res = await db_exec(
-            "SELECT messages_json, response_json FROM chat_logs WHERE session_id = ? ORDER BY id DESC LIMIT ?",
-            [session_id, max_turns * 2]
-        )
-    rows = getattr(res, "rows", None) or res or []
+        sql = f"""
+            SELECT messages_json, response_json
+            FROM chat_logs
+            WHERE session_id = ?
+            ORDER BY id DESC
+            LIMIT {limit}
+        """
+        params = [session_id]
+
+    try:
+        res = await db_exec(sql, params)
+        rows = getattr(res, "rows", None) or res or []
+    except Exception as e:
+        print("[load_memory SQL error]", repr(e))
+        return []
+
     convo: list[dict] = []
     for row in rows:
         messages_json, response_json = row
@@ -165,19 +177,16 @@ async def load_memory(session_id: Optional[str], project_id: Optional[str], max_
         except Exception:
             ms, resp = [], None
 
-        # message user le plus récent de ce tour
         user_last = None
         for m in reversed(ms or []):
             if m.get("role") == "user":
-                user_last = m.get("content")
-                break
+                user_last = m.get("content"); break
         if user_last:
             convo.append({"role": "user", "content": user_last})
 
-        # réponse assistant
         assistant_text = None
         if isinstance(resp, dict):
-            if "content" in resp:  # cas stream
+            if "content" in resp:
                 assistant_text = resp.get("content")
             else:
                 try:
@@ -188,7 +197,7 @@ async def load_memory(session_id: Optional[str], project_id: Optional[str], max_
             convo.append({"role": "assistant", "content": assistant_text})
 
     convo.reverse()
-    return convo[-(max_turns*2):]
+    return convo[-limit:]
 
 # ==================== HEALTH & MIGRATE ====================
 @app.get("/", response_class=HTMLResponse)
@@ -359,6 +368,13 @@ async def chat(body: ChatBody, stream: int = Query(default=0)):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {OPENAI_API_KEY}",
     }
+    org = os.getenv("OPENAI_ORG_ID")
+    if org:
+        headers["OpenAI-Organization"] = org
+    proj = os.getenv("OPENAI_PROJECT_ID")
+    if proj:
+        headers["OpenAI-Project"] = proj
+
     # Utile pour certains proxies/upstreams en streaming
     headers_stream = dict(headers)
     headers_stream["Accept"] = "text/event-stream"
