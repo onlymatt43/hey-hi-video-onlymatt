@@ -322,7 +322,8 @@ async def chat(body: ChatBody, stream: int = Query(default=0)):
 
     context = ""
     try:
-        if db and user_query.strip():
+        # Ne lance le RAG que si TOP_K > 0 et qu'il y a une question
+        if TOP_K > 0 and db and user_query.strip():
             q_vec = await _embed_cached(user_query)
             q = np.array(q_vec, dtype=np.float32)
 
@@ -347,49 +348,65 @@ async def chat(body: ChatBody, stream: int = Query(default=0)):
             )
             messages = [{"role": "system", "content": system_preface}] + messages
     except Exception as e:
+        # ne casse pas la requête si la récupération KB échoue
         print("[KB retrieval error]", repr(e))
 
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {OPENAI_API_KEY}"}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+    }
+    # Utile pour certains proxies/upstreams en streaming
+    headers_stream = dict(headers)
+    headers_stream["Accept"] = "text/event-stream"
+
     payload = {"model": model, "messages": messages, "stream": bool(stream)}
     timeout = httpx.Timeout(connect=LLM_CONNECT_TIMEOUT, read=LLM_READ_TIMEOUT)
 
-    # ---- Non-stream ----
+    # ---- Non-stream : renvoyer clairement l'erreur OpenAI au client ----
     if not stream:
-        tries, delay = 3, 0.5
-        last_err = None
-        for _ in range(tries):
-            try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    r = await client.post(OPENAI_CHAT_URL, headers=headers, json=payload)
-                if r.status_code >= 400:
-                    return JSONResponse(status_code=502, content={"code": "UPSTREAM_ERROR", "message": r.text})
-                data = r.json()
-                usage = data.get("usage", {}) or {}
-                asyncio.create_task(save_chat(
+        try:
+            async with httpx.AsyncClient(timeout=timeout, http2=False) as client:
+                r = await client.post(OPENAI_CHAT_URL, headers=headers, json=payload)
+            if r.status_code >= 400:
+                # Propager l'erreur OpenAI en clair
+                return JSONResponse(
+                    status_code=r.status_code,
+                    content={
+                        "provider": "openai",
+                        "error": "UPSTREAM_ERROR",
+                        "status": r.status_code,
+                        "body": r.text,
+                    },
+                )
+            data = r.json()
+            usage = data.get("usage", {}) or {}
+            asyncio.create_task(
+                save_chat(
                     session_id, model, messages, data,
                     usage.get("prompt_tokens"), usage.get("completion_tokens"),
                     project_id
-                ))
-                # renvoyer session_id pour que le front puisse le persister
-                return {
-                    "provider": "openai",
-                    "model": model,
-                    "choices": data.get("choices", []),
-                    "usage": usage,
-                    "session_id": session_id,
-                }
-            except Exception as e:
-                last_err = e
-                await asyncio.sleep(delay)
-                delay *= 2
-        raise HTTPException(status_code=502, detail=f"Upstream non-stream error: {last_err}")
+                )
+            )
+            return {
+                "provider": "openai",
+                "model": model,
+                "choices": data.get("choices", []),
+                "usage": usage,
+                "session_id": session_id,
+            }
+        except Exception as e:
+            # Renvoie un message d'erreur lisible (au lieu d'un 500 opaque)
+            return JSONResponse(status_code=502, content={
+                "error": "NONSTREAM_EXCEPTION",
+                "message": str(e)
+            })
 
-    # ---- Streaming SSE ----
+    # ---- Streaming SSE : http2 désactivé + Accept: text/event-stream ----
     async def sse_gen() -> AsyncIterator[str]:
         collected: list[str] = []
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream("POST", OPENAI_CHAT_URL, headers=headers, json=payload) as resp:
+            async with httpx.AsyncClient(timeout=timeout, http2=False) as client:
+                async with client.stream("POST", OPENAI_CHAT_URL, headers=headers_stream, json=payload) as resp:
                     if resp.status_code >= 400:
                         txt = (await resp.aread()).decode("utf-8", "ignore")
                         yield f"data: {json.dumps({'error': resp.status_code, 'message': txt})}\n\n"
@@ -411,6 +428,7 @@ async def chat(body: ChatBody, stream: int = Query(default=0)):
                             yield line + "\n\n"
                     yield "data: [DONE]\n\n"
         except Exception as e:
+            # Surface l'erreur dans le flux SSE
             yield f"data: {json.dumps({'error':'STREAM_FAILED','message':str(e)})}\n\n"
             yield "data: [DONE]\n\n"
         finally:
@@ -420,8 +438,8 @@ async def chat(body: ChatBody, stream: int = Query(default=0)):
                     "model": model,
                     "content": "".join(collected) if collected else None,
                 }
-                asyncio.create_task(save_chat(
-                    session_id, model, messages, response_json, tokens_in=None, tokens_out=None, project_id=project_id
-                ))
+                asyncio.create_task(
+                    save_chat(session_id, model, messages, response_json, None, None, project_id)
+                )
 
     return StreamingResponse(sse_gen(), media_type="text/event-stream")
