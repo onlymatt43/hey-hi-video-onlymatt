@@ -31,6 +31,25 @@ TOP_K = int(os.getenv("KB_TOP_K", "5"))
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
 MEMORY_MAX_TURNS = int(os.getenv("MEMORY_MAX_TURNS", "50"))  # 50 derniers tours (user+assistant)
 
+# ---- TIMEOUTS & RETRIES (globaux) ----
+HTTPX_TIMEOUT = httpx.Timeout(
+    connect=float(os.getenv("LLM_TIMEOUT_CONNECT", "10")),
+    read=float(os.getenv("LLM_TIMEOUT_READ", "70")),
+    write=float(os.getenv("LLM_TIMEOUT_READ", "70")),
+    pool=float(os.getenv("LLM_TIMEOUT_CONNECT", "10")),
+)
+
+def _headers_chat():
+    h = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    org = os.getenv("OPENAI_ORG_ID")
+    proj = os.getenv("OPENAI_PROJECT_ID")
+    if org:  h["OpenAI-Organization"] = org
+    if proj: h["OpenAI-Project"] = proj
+    return h
+
 # ==================== APP & CORS ====================
 app = FastAPI()
 
@@ -139,18 +158,14 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
 async def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    headers = _headers_chat()
     payload = {"model": EMBED_MODEL, "input": texts}
-    timeout = httpx.Timeout(
-        connect=LLM_CONNECT_TIMEOUT,
-        read=LLM_READ_TIMEOUT,
-        write=LLM_READ_TIMEOUT,
-        pool=LLM_CONNECT_TIMEOUT,
-    )
-    async with httpx.AsyncClient(timeout=timeout, http2=False) as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=False) as c:
         r = await c.post(OPENAI_EMBED_URL, headers=headers, json=payload)
-        r.raise_for_status()
-        d = r.json()
+    if r.status_code >= 400:
+        # on lève pour être catch plus haut sans planter le service
+        raise RuntimeError(f"EMBEDDINGS_UPSTREAM_ERROR {r.status_code}: {r.text[:300]}")
+    d = r.json()
     return [item["embedding"] for item in d["data"]]
 
 # ==================== MEMORY ====================
@@ -243,7 +258,30 @@ async def favicon():
 # --- Version pour vérifier que le bon code est déployé ---
 @app.get("/__version")
 async def __version():
-    return {"version": "minimal-openai-proxy-v1"}
+    return {"version": "hardened-v1"}
+
+@app.get("/__diag")
+async def __diag():
+    kb_count = None
+    try:
+        if db:
+            res = await db_exec("SELECT COUNT(*) FROM kb_chunks", [])
+            rows = getattr(res, "rows", None) or res or []
+            kb_count = rows[0][0] if rows else None
+    except Exception:
+        kb_count = None
+    return {
+        "status": "ok",
+        "chat_model": CHAT_MODEL,
+        "embed_model": EMBED_MODEL,
+        "has_openai_key": bool(OPENAI_API_KEY),
+        "has_turso": bool(db is not None),
+        "memory_enabled": MEMORY_ENABLED,
+        "memory_max_turns": MEMORY_MAX_TURNS,
+        "kb_top_k": TOP_K,
+        "kb_chunks": kb_count,
+        "allowed_origins": ALLOWED_ORIGINS,
+    }
 
 @app.get("/healthz")
 async def healthz():
@@ -327,7 +365,7 @@ async def _embed_cached(text: str) -> list[float]:
     EMBED_CACHE.cache[key] = vec
     return vec
 
-# === /api/chat avec MEMOIRE (sans RAG), logs Turso ===
+# === /api/chat HARDENED (mémoire ON, RAG OFF par défaut) ===
 @app.post("/api/chat")
 async def chat_with_memory(body: ChatBody, stream: int = Query(default=0)):
     if not OPENAI_API_KEY:
@@ -336,9 +374,11 @@ async def chat_with_memory(body: ChatBody, stream: int = Query(default=0)):
     model = body.model or CHAT_MODEL
     session_id = body.session_id or str(uuid.uuid4())
     project_id = body.project_id
-    messages = [m.model_dump() for m in body.messages]
+    # On garde le tour courant "propre" pour stockage
+    messages_current = [m.model_dump() for m in body.messages]
+    messages = messages_current[:]
 
-    # -------- Mémoire : prépendre l'historique --------
+    # -------- Mémoire (prépend) --------
     if MEMORY_ENABLED:
         try:
             past = await load_memory(session_id, project_id, MEMORY_MAX_TURNS)
@@ -347,31 +387,21 @@ async def chat_with_memory(body: ChatBody, stream: int = Query(default=0)):
                     "role": "system",
                     "content": (
                         "Utilise l'historique ci-dessous pour répondre de façon cohérente. "
-                        "Si l'utilisateur a partagé un fait (ex: son nom, préférences), réutilise-le quand c'est pertinent."
+                        "Si l'utilisateur a partagé un fait (ex: son nom, préférences), "
+                        "réutilise-le quand c'est pertinent."
                     )
                 }
                 messages = [system_preface] + past + messages
         except Exception as e:
             print("[memory] load error:", repr(e))
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    # support org/projet (optionnel)
-    org = os.getenv("OPENAI_ORG_ID")
-    proj = os.getenv("OPENAI_PROJECT_ID")
-    if org: headers["OpenAI-Organization"] = org
-    if proj: headers["OpenAI-Project"] = proj
-
+    headers = _headers_chat()
     payload = {"model": model, "messages": messages, "stream": bool(stream)}
-    timeout = httpx.Timeout(connect=LLM_CONNECT_TIMEOUT, read=LLM_READ_TIMEOUT,
-                            write=LLM_READ_TIMEOUT, pool=LLM_CONNECT_TIMEOUT)
 
-    # ---- Non-stream ----
+    # ---------- Non-stream (retours JSON propres, + write DB bloquant) ----------
     if not stream:
         try:
-            async with httpx.AsyncClient(timeout=timeout, http2=False) as client:
+            async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=False) as client:
                 r = await client.post(OPENAI_CHAT_URL, headers=headers, json=payload)
 
             if r.status_code >= 400:
@@ -383,10 +413,10 @@ async def chat_with_memory(body: ChatBody, stream: int = Query(default=0)):
             data = r.json()
             usage = data.get("usage", {}) or {}
 
-            # Sauvegarde synchrone (mémoire garantie immédiatement)
+            # Ecriture DB bloquante => mémoire dispo tout de suite au prochain tour
             try:
                 await save_chat(
-                    session_id, model, messages, data,
+                    session_id, model, messages_current, data,
                     usage.get("prompt_tokens"), usage.get("completion_tokens"),
                     project_id
                 )
@@ -398,25 +428,25 @@ async def chat_with_memory(body: ChatBody, stream: int = Query(default=0)):
                 "model": model,
                 "choices": data.get("choices", []),
                 "usage": usage,
-                "session_id": session_id,        # renvoyé pour que le front le persiste
+                "session_id": session_id,
                 "project_id": project_id,
             }
 
         except Exception as e:
             return JSONResponse(status_code=502, content={"error":"NONSTREAM_EXCEPTION","message":str(e)})
 
-    # ---- Streaming SSE ----
+    # ---------- Streaming SSE (HTTP/1 forcé, erreurs en SSE, write DB en finally) ----------
     headers_stream = dict(headers)
     headers_stream["Accept"] = "text/event-stream"
 
     async def sse_gen() -> AsyncIterator[str]:
         collected: list[str] = []
         try:
-            async with httpx.AsyncClient(timeout=timeout, http2=False) as client:
+            async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, http2=False) as client:
                 async with client.stream("POST", OPENAI_CHAT_URL, headers=headers_stream, json=payload) as resp:
                     if resp.status_code >= 400:
                         txt = (await resp.aread()).decode("utf-8", "ignore")
-                        yield f"data: {json.dumps({'error':'UPSTREAM_ERROR','status': resp.status_code, 'body': txt})}\n\n"
+                        yield f"data: {json.dumps({'error':'UPSTREAM_ERROR','status': resp.status_code, 'body': txt[:500]})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
                     async for line in resp.aiter_lines():
@@ -432,14 +462,12 @@ async def chat_with_memory(body: ChatBody, stream: int = Query(default=0)):
                                         collected.append(piece)
                                 except Exception:
                                     pass
-                            # renvoyer tel quel au client
                             yield line + "\n\n"
                     yield "data: [DONE]\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error':'STREAM_FAILED','message':str(e)})}\n\n"
             yield "data: [DONE]\n\n"
         finally:
-            # Sauvegarde du transcript streamé pour la mémoire
             if db is not None:
                 try:
                     response_json = {
@@ -447,9 +475,8 @@ async def chat_with_memory(body: ChatBody, stream: int = Query(default=0)):
                         "model": model,
                         "content": "".join(collected) if collected else None,
                     }
-                    asyncio.create_task(
-                        save_chat(session_id, model, messages, response_json, None, None, project_id)
-                    )
+                    # On stocke le tour courant (pas le passé prépendu)
+                    await save_chat(session_id, model, messages_current, response_json, None, None, project_id)
                 except Exception as e:
                     print("[save_chat stream] error:", repr(e))
 
