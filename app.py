@@ -1,4 +1,3 @@
-
 import os, json, asyncio, uuid, struct, re
 from typing import AsyncIterator, Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Query, Body
@@ -494,31 +493,33 @@ async def chat_with_memory(body: ChatBody, stream: int = Query(default=0)):
         known_name = extract_known_name(scan_messages)
         known_prefs = extract_known_prefs(scan_messages)  # ex: {'drink': 'café', 'couleur': 'bleu'}
 
-        hint_lines = []
+        facts = []
         if known_name:
-            hint_lines.append(
-                f"- Nom connu : « {known_name} ». "
-                f"Si l'utilisateur demande « Quel est mon nom ? », "
-                f"réponds exactement « {known_name} »."
-            )
+            facts.append(f"- Nom de l'utilisateur : « {known_name} ».")  # fait certain
         if "drink" in known_prefs:
-            hint_lines.append(
-                f"- Boisson préférée : « {known_prefs['drink']} ». "
-                f"Si on te demande la boisson préférée de l'utilisateur, "
-                f"réponds exactement « {known_prefs['drink']} »."
-            )
+            facts.append(f"- Boisson préférée : « {known_prefs['drink']} ».")  # fait certain
+
+        # Hints génériques (on limite à 3 pour éviter un prompt trop long)
         extras = []
         for k, v in known_prefs.items():
             if k == "drink":
                 continue
             if len(extras) < 3:
                 extras.append(f"- {k.capitalize()} préféré(e) : « {v} ».")
-        if hint_lines or extras:
+
+        if facts or extras:
             messages = [{
                 "role": "system",
                 "content": (
-                    "Mémoire session — Faits à appliquer strictement si pertinent :\n"
-                    + "\n".join(hint_lines + extras)
+                    "Règle d'or : tu DOIS utiliser les faits mémorisés ci-dessous pour répondre à toute "
+                    "question qui s'y rapporte (même si la question demande plusieurs éléments à la fois). "
+                    "Réponds explicitement avec les valeurs connues, sans dire que tu ne sais pas.\n\n"
+                    "Faits mémorisés :\n"
+                    + "\n".join(facts + extras) +
+                    "\n\nExemples d'application :\n"
+                    "- Si on te demande le nom de l'utilisateur, réponds exactement le nom connu.\n"
+                    "- Si on te demande la boisson préférée, réponds exactement la boisson connue.\n"
+                    "- Si on te demande les deux en même temps, donne les deux valeurs connues clairement."
                 )
             }] + messages
     except Exception as e:
